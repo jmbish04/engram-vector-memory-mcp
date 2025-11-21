@@ -1,0 +1,72 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "memory-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"migrations": [
+		{
+			"new_sqlite_classes": [
+				"MyMCP"
+			],
+			"tag": "v1"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "MyMCP",
+				"name": "MCP_OBJECT"
+			}
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "memory-db",
+			"database_id": "YOUR_DATABASE_ID_HERE"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			"index_name": "memory-index"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"queues": {
+		"producers": [
+			{
+				"queue": "memory-ingest",
+				"binding": "QUEUE"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "memory-ingest",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5
+			}
+		]
+	},
+	"observability": {
+		"enabled": true
+	},
+	"triggers": {
+		"crons": [
+			"0 2 * * *"
+		]
+	}
+}

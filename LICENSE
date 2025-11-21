@@ -1,0 +1,43 @@
+# Engram Dual License
+
+Engram is available under two licensing options:
+
+## 1. MIT License (Community Use)
+
+For **individuals, educational institutions, and community projects**, Engram is licensed under the MIT License. See [LICENSE-MIT](LICENSE-MIT) for full terms.
+
+**Permitted uses under MIT:**
+- Personal projects
+- Educational and research purposes
+- Open-source projects
+- Non-commercial applications
+
+## 2. Commercial License
+
+For **organizations using Engram in commercial products, services, or platforms**, a commercial license is required.
+
+**Commercial use includes:**
+- Integration into proprietary software or SaaS products
+- Use in revenue-generating applications or services
+- Deployment in commercial platforms or infrastructure
+- White-labeling or reselling Engram functionality
+
+**To obtain a commercial license:**
+
+Contact: license@foundation42.org
+Organization: Foundation42
+Website: https://github.com/Foundation42
+
+## How to Choose
+
+If you're unsure which license applies to your use case:
+
+- **MIT License:** If you're an individual developer, student, researcher, or working on an open-source project
+- **Commercial License:** If your organization generates revenue from products or services that use Engram
+
+When in doubt, reach out to license@foundation42.org for clarification.
+
+---
+
+Copyright (c) 2025 Christian Beaumont / Foundation42
+All rights reserved under commercial terms.
