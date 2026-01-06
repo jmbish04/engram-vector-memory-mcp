@@ -162,3 +162,35 @@ export async function generateVision(
     }
 }
 
+/**
+ * Rewrites a user question to be more specific and suitable for an MCP tool search, given the context provided.
+ * Uses generateText with a specialized prompt.
+ */
+export async function rewriteQuestionForMCP(
+    env: Env,
+    question: string,
+    context?: {
+        bindings?: string[];
+        libraries?: string[];
+        tags?: string[];
+        codeSnippets?: Array<{ file_path: string; code: string; relation: string }>;
+    },
+    options: {
+        provider?: 'worker-ai' | 'gemini' | 'openai';
+        model?: string;
+    } = {}
+): Promise<string> {
+    const contextStr = context ? JSON.stringify(context, null, 2) : "None";
+    const prompt = `Rewrite the following user question to be more specific and suitable for an MCP tool search, given the context provided.
+User Question: "${question}"
+Context: ${contextStr}
+Return ONLY the rewritten question.`;
+
+    const system = "You are a helpful assistant that refines queries for search tools.";
+
+    return generateText(env, prompt, {
+        provider: options.provider,
+        model: options.model,
+        system: system
+    });
+}

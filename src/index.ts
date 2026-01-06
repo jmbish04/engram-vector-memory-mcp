@@ -10,7 +10,9 @@ import {
   deleteMemories,
 } from "./db/queries";
 import * as VectorService from "./db/vectorize";
+import { AIModelOptions } from "./ai";
 import * as AIProvider from "./ai";
+import { sanitizeAndFormatResponse } from "./ai/utils/sanitizer";
 import { SignalLogger } from "./utils/logger";
 
 // --- Types ---
@@ -79,6 +81,14 @@ export default {
       return handleSearch(request, env, url);
     }
 
+    if (url.pathname === "/api/ai/generate" && request.method === "POST") {
+      return handleAIGenerate(request, env);
+    }
+
+    if (url.pathname === "/api/search/rewritten" && request.method === "POST") {
+      return handleRewrittenSearch(request, env);
+    }
+
     // 3. Standard MCP Endpoints
     if (url.pathname === "/sse")
       return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
@@ -119,7 +129,10 @@ export default {
             // Retry Wrapper for Robustness
             await withRetry(async () => {
                 // 1. Vectorize
-                await VectorService.upsertMemoryVector(env, text, id, timestamp);
+                await VectorService.upsertMemoryVector(env, text, id, timestamp, {
+                    primary_tag: context_tags && context_tags.length > 0 ? context_tags[0] : "general",
+                    priority_rank: 0 // Default rank
+                });
                 
                 // 2. D1
                 await createMemory(env.DB, {
@@ -196,6 +209,86 @@ async function handleSearch(req: Request, env: Env, url: URL) {
     }
 }
 
+async function handleAIGenerate(req: Request, env: Env) {
+    try {
+        const body = await req.json() as any;
+        const { prompt, system, provider, model, schema } = body;
+
+        if (!prompt) return new Response(JSON.stringify({ error: "Missing prompt" }), { status: 400 });
+
+        logger.log('process', `AI generation requested: "${prompt.substring(0, 50)}..."`);
+
+        let response;
+        if (schema) {
+            // Use structured generation if schema is provided
+            response = await AIProvider.generateStructured(env, prompt, schema, {
+                provider: provider || "worker-ai",
+                system: system,
+                model: model,
+            });
+            // If response is object, stringify it for consistent return type
+            if (typeof response !== 'string') {
+                response = JSON.stringify(response);
+            }
+        } else {
+            // Standard text generation
+            response = await AIProvider.generateText(env, prompt, {
+                provider: provider || "worker-ai",
+                system: system,
+                model: model,
+            });
+            
+            // Sanitize text response to prevent XSS and format Markdown
+            response = AIProvider.sanitizeAndFormatResponse(response);
+        }
+
+        logger.log('success', `AI generation completed`);
+
+        return new Response(JSON.stringify({
+            success: true,
+            response
+        }), {
+            headers: { "Content-Type": "application/json" }
+        });
+    } catch (e: any) {
+        logger.log('error', `AI generation failed: ${e.message}`);
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+    }
+}
+
+async function handleRewrittenSearch(req: Request, env: Env) {
+    try {
+        const body = await req.json() as any;
+        const { queries, context, topK, provider, model } = body;
+
+        if (!queries || !Array.isArray(queries) || queries.length === 0) {
+            return new Response(JSON.stringify({ error: "Missing or invalid queries array" }), { status: 400 });
+        }
+
+        logger.log('process', `Rewritten search requested for ${queries.length} queries`);
+
+        const results = await VectorService.queryMultipleRewrittenVectors(
+            env,
+            queries,
+            context,
+            topK || 5,
+            { provider, model }
+        );
+
+        logger.log('success', `Rewritten search completed for ${results.length} queries`);
+
+        return new Response(JSON.stringify({
+            success: true,
+            results
+        }), {
+            headers: { "Content-Type": "application/json" }
+        });
+    } catch (e: any) {
+        logger.log('error', `Rewritten search failed: ${e.message}`);
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+    }
+}
+
 // --- Helpers ---
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
@@ -244,7 +337,10 @@ async function curateMemories(env: Env): Promise<void> {
                 });
 
                 await updateConsolidatedMemory(env.DB, memory.id, newText);
-                await VectorService.upsertMemoryVector(env, newText, memory.id, memory.createdAt);
+                await VectorService.upsertMemoryVector(env, newText, memory.id, memory.createdAt, {
+                    priority_rank: 1, // Higher priority for consolidated memories
+                    primary_tag: "consolidated"
+                });
 
                 const deleteIds = duplicates.map((d) => d.id);
                 await deleteMemories(env.DB, deleteIds);
