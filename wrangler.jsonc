@@ -2,10 +2,6 @@
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "memory-mcp",
@@ -14,6 +10,16 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"upload_source_maps": true,
+	"workers_dev": true,
+	"assets": {
+		"directory": "./client/dist",
+		"binding": "ASSETS"
+	},
+	"vars": {
+		"SIMILIARITY_THRESHOLD": 0.92,
+		"AI_GATEWAY_NAME": "shell-ask"
+	},
 	"migrations": [
 		{
 			"new_sqlite_classes": [
@@ -33,29 +39,33 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "memory-db",
-			"database_id": "YOUR_DATABASE_ID_HERE"
+			"database_name": "engram-vector-memory-mcp",
+			"database_id": "8214d820-9b3f-4a4c-b3af-ba2334d9fc93",
+			"migrations_dir": ".drizzle/migrations",
+			"remote": true
 		}
 	],
 	"vectorize": [
 		{
 			"binding": "VECTORIZE",
-			"index_name": "memory-index"
+			"index_name": "engram-vector-memory-mcp",
+			"remote": true
 		}
-	],
+	],	
 	"ai": {
-		"binding": "AI"
+		"binding": "AI",
+		"remote": true
 	},
 	"queues": {
 		"producers": [
 			{
-				"queue": "memory-ingest",
+				"queue": "engram-vector-memory-mcp",
 				"binding": "QUEUE"
 			}
 		],
 		"consumers": [
 			{
-				"queue": "memory-ingest",
+				"queue": "engram-vector-memory-mcp",
 				"max_batch_size": 10,
 				"max_batch_timeout": 5
 			}
@@ -68,5 +78,6 @@
 		"crons": [
 			"0 2 * * *"
 		]
-	}
+	},
+
 }

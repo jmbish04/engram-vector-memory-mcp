@@ -5,6 +5,8 @@
 		"jsx": "react-jsx",
 		"module": "es2022",
 		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"esModuleInterop": true,
 		"resolveJsonModule": true,
 		"allowJs": true,
 		"checkJs": false,
@@ -19,5 +21,9 @@
 			"node"
 		]
 	},
-	"include": ["worker-configuration.d.ts", "src/**/*.ts"]
+	"include": [
+		"worker-configuration.d.ts",
+		"src/**/*.ts",
+		"vite.config.ts"
+	]
 }

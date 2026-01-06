@@ -1,294 +1,263 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import { MemoryTools } from "./tools/memory";
+import {
+  createMemory,
+  getMemoriesByIds,
+  getRawMemories,
+  markMemoryProcessed,
+  updateConsolidatedMemory,
+  deleteMemories,
+} from "./db/queries";
+import * as VectorService from "./db/vectorize";
+import * as AIProvider from "./ai";
+import { SignalLogger } from "./utils/logger";
 
+// --- Types ---
 interface MemoryMessage {
-	text: string;
-	context_tags?: string[];
-	timestamp: number;
-	source_app?: string;
-	session_id?: string;
+  text: string;
+  context_tags?: string[];
+  timestamp: number;
+  source_app?: string;
+  session_id?: string;
 }
 
-// Define our Memory MCP agent
+// Global logger instance for this worker
+const logger = new SignalLogger();
+
+// --- The Agent ---
 export class MyMCP extends McpAgent {
-	server = new McpServer({
-		name: "Global Memory System",
-		version: "1.0.0",
-	});
+  server = new McpServer({
+    name: "Global Memory System",
+    version: "2.0.0",
+  });
 
-	async init() {
-		// TOOL 1: Save Memory (Fast! Just pushes to queue)
-		this.server.tool(
-			"save_memory",
-			{
-				text: z.string().describe("The text to remember"),
-				context_tags: z.array(z.string()).optional().describe("Optional tags for categorization (e.g., ['coding', 'preferences'])"),
-				source_app: z.string().optional().describe("The application this memory came from"),
-				session_id: z.string().optional().describe("Session identifier"),
-			},
-			async ({ text, context_tags, source_app, session_id }) => {
-				const message: MemoryMessage = {
-					text,
-					context_tags: context_tags || ["general"],
-					timestamp: Date.now(),
-					source_app,
-					session_id,
-				};
-
-				// Push to queue for async processing
-				await this.env.QUEUE.send(message);
-
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Memory queued for processing: "${text.substring(0, 50)}${text.length > 50 ? "..." : ""}"`,
-						},
-					],
-				};
-			},
-		);
-
-		// TOOL 2: Search Memory (The Recall)
-		this.server.tool(
-			"search_memory",
-			{
-				query: z.string().describe("What to search for in memories"),
-				limit: z.number().optional().default(5).describe("Number of results to return (default: 5)"),
-				filter_tags: z.array(z.string()).optional().describe("Optional tags to filter by"),
-			},
-			async ({ query, limit = 5, filter_tags }) => {
-				try {
-					// 1. Generate vector for the query using Cloudflare AI
-					const embeddings = await this.env.AI.run("@cf/baai/bge-base-en-v1.5", {
-						text: [query],
-					});
-					const queryVector = embeddings.data[0];
-
-					// 2. Search the Vector Index
-					const vectorResults = await this.env.VECTORIZE.query(queryVector, {
-						topK: limit,
-						returnMetadata: true,
-					});
-
-					// 3. Format results
-					if (vectorResults.matches.length === 0) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: "No memories found matching your query.",
-								},
-							],
-						};
-					}
-
-					const memories = vectorResults.matches.map((match, idx) => {
-						const metadata = match.metadata as any;
-						return `${idx + 1}. [Score: ${match.score?.toFixed(3)}] ${metadata.text}\n   Tags: ${metadata.tags}\n   Created: ${metadata.created_at}`;
-					});
-
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Found ${memories.length} memories:\n\n${memories.join("\n\n")}`,
-							},
-						],
-					};
-				} catch (error) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Error searching memories: ${error instanceof Error ? error.message : String(error)}`,
-							},
-						],
-					};
-				}
-			},
-		);
-	}
+  async init() {
+    // Register Memory Tools
+    // 'this.env' is automatically populated by the base class before init() is called
+    const memoryTools = new MemoryTools(this.server, this.env); 
+    memoryTools.register();
+  }
 }
 
-async function curateMemories(env: Env): Promise<void> {
-	console.log("🧹 Memory Curator: Starting daily curation...");
-
-	try {
-		// 1. Get all memories from D1
-		const result = await env.DB.prepare("SELECT * FROM memories ORDER BY created_at DESC").all();
-		const memories = result.results as any[];
-
-		if (memories.length < 2) {
-			console.log("Not enough memories to curate");
-			return;
-		}
-
-		console.log(`Found ${memories.length} memories to analyze`);
-
-		// 2. Find similar memories using Vectorize
-		const duplicatePairs: Array<{ memory: any; duplicates: any[] }> = [];
-
-		for (const memory of memories) {
-			// Get embedding for this memory
-			const embeddings = await env.AI.run("@cf/baai/bge-base-en-v1.5", {
-				text: [memory.text],
-			});
-			const vector = embeddings.data[0];
-
-			// Search for very similar memories (>0.95 similarity)
-			const similar = await env.VECTORIZE.query(vector, {
-				topK: 5,
-				returnMetadata: true,
-			});
-
-			const duplicates = similar.matches.filter(
-				(match) => match.id !== memory.id && match.score && match.score > 0.95,
-			);
-
-			if (duplicates.length > 0) {
-				duplicatePairs.push({ memory, duplicates });
-			}
-		}
-
-		console.log(`Found ${duplicatePairs.length} potential duplicate groups`);
-
-		// 3. Use LLM to intelligently consolidate duplicates
-		let consolidatedCount = 0;
-
-		for (const { memory, duplicates } of duplicatePairs.slice(0, 10)) {
-			// Limit to 10 per run
-			const duplicateTexts = duplicates.map((d, i) => `${i + 1}. ${d.metadata?.text}`).join("\n");
-
-			const prompt = `You are a memory curator. Analyze these similar memories and create ONE consolidated memory that preserves all important information:
-
-ORIGINAL:
-${memory.text}
-
-SIMILAR MEMORIES:
-${duplicateTexts}
-
-Create a single, comprehensive memory that combines the key information from all of these. Be concise but complete.`;
-
-			const response = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-				messages: [{ role: "user", content: prompt }],
-				max_tokens: 500,
-			});
-
-			const consolidatedText = (response as any).response;
-
-			if (consolidatedText) {
-				// Generate new embedding for consolidated memory
-				const newEmbeddings = await env.AI.run("@cf/baai/bge-base-en-v1.5", {
-					text: [consolidatedText],
-				});
-				const newVector = newEmbeddings.data[0];
-
-				// Update the original memory
-				await env.DB.prepare("UPDATE memories SET text = ? WHERE id = ?")
-					.bind(consolidatedText, memory.id)
-					.run();
-
-				// Update in Vectorize
-				await env.VECTORIZE.upsert([
-					{
-						id: memory.id,
-						values: newVector,
-						metadata: {
-							text: consolidatedText,
-							tags: memory.tags,
-							created_at: memory.created_at,
-							source_app: memory.source_app,
-							session_id: memory.session_id,
-						},
-					},
-				]);
-
-				// Delete duplicates
-				for (const dup of duplicates) {
-					await env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(dup.id).run();
-					await env.VECTORIZE.deleteByIds([dup.id]);
-				}
-
-				consolidatedCount++;
-				console.log(`✅ Consolidated memory ${memory.id} (removed ${duplicates.length} duplicates)`);
-			}
-		}
-
-		console.log(`🎉 Memory Curator: Completed! Consolidated ${consolidatedCount} memory groups`);
-	} catch (error) {
-		console.error("❌ Memory Curator failed:", error);
-	}
-}
+// --- Background Logic ---
 
 export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		const url = new URL(request.url);
+  // Handle HTTP (MCP Protocol + API Routes + SSE)
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
 
-		if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-			return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
-		}
+    // 1. SSE Stream for Logs
+    if (url.pathname === "/api/sse/logs") {
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      const encoder = new TextEncoder();
 
-		if (url.pathname === "/mcp") {
-			return MyMCP.serve("/mcp").fetch(request, env, ctx);
-		}
+      // Send initial logs
+      const recent = logger.getRecentLogs();
+      recent.forEach(log => {
+        writer.write(encoder.encode(`data: ${JSON.stringify(log)}\n\n`));
+      });
 
-		if (url.pathname === "/trigger-curator") {
-			// Manual trigger for testing the curator
-			ctx.waitUntil(curateMemories(env));
-			return new Response("Memory curator triggered manually", { status: 200 });
-		}
+      // Keep connection open (simplified for demo)
+      // In production, use Durable Objects for broadcasting real-time logs
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
 
-		return new Response("Not found", { status: 404 });
-	},
+    // 2. API Routes for Frontend
+    if (url.pathname === "/api/memory" && request.method === "POST") {
+      return handlePostMemory(request, env);
+    }
 
-	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-		// Run the memory curator
-		ctx.waitUntil(curateMemories(env));
-	},
+    if (url.pathname === "/api/search" && request.method === "GET") {
+      return handleSearch(request, env, url);
+    }
 
-	async queue(batch: MessageBatch<MemoryMessage>, env: Env, ctx: ExecutionContext) {
-		// Process queue messages directly (can't pass MessageBatch to Durable Objects)
-		for (const message of batch.messages) {
-			const { text, context_tags, timestamp, source_app, session_id } = message.body;
+    // 3. Standard MCP Endpoints
+    if (url.pathname === "/sse")
+      return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
+    if (url.pathname === "/mcp")
+      return MyMCP.serve("/mcp").fetch(request, env, ctx);
 
-			try {
-				// A. Generate Embedding using Cloudflare AI
-				const embeddings = await env.AI.run("@cf/baai/bge-base-en-v1.5", {
-					text: [text],
-				});
-				const vector = embeddings.data[0];
+    // 4. Manual Trigger
+    if (url.pathname === "/trigger-curator") {
+      ctx.waitUntil(curateMemories(env));
+      return new Response("Curator triggered", { status: 202 });
+    }
 
-				// B. Store in Vectorize (Fast retrieval)
-				const id = crypto.randomUUID();
-				await env.VECTORIZE.insert([
-					{
-						id: id,
-						values: vector,
-						metadata: {
-							text: text,
-							tags: JSON.stringify(context_tags),
-							created_at: new Date(timestamp).toISOString(),
-							source_app: source_app || "unknown",
-							session_id: session_id || "unknown",
-						},
-					},
-				]);
+    // Default: Serve Assets (handled by Worker Assets binding automatically if configured)
+    // If not found, fall through to 404 or index.html for SPA routing
+    return new Response("Global Memory Agent Active", { status: 200 });
+  },
 
-				// C. Store in D1 SQL for complex analytics later
-				await env.DB.prepare(
-					"INSERT INTO memories (id, text, tags, created_at, source_app, session_id) VALUES (?, ?, ?, ?, ?, ?)",
-				)
-					.bind(id, text, JSON.stringify(context_tags), timestamp, source_app || "unknown", session_id || "unknown")
-					.run();
+  // Handle Cron Triggers
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(curateMemories(env));
+  },
 
-				console.log(`✅ Successfully memorized: ${id}`);
-				message.ack();
-			} catch (err) {
-				console.error("❌ Failed to process memory:", err);
-				message.retry();
-			}
-		}
-	},
+  // Handle Queue
+  async queue(
+    batch: MessageBatch<MemoryMessage>,
+    env: Env,
+    ctx: ExecutionContext
+  ) {
+    const results = await Promise.allSettled(
+      batch.messages.map(async (message) => {
+        try {
+            const { text, context_tags, timestamp, source_app, session_id } =
+            message.body;
+            const id = crypto.randomUUID();
+
+            logger.log('process', `Ingesting memory from ${source_app}: "${text.substring(0, 30)}..."`);
+
+            // Retry Wrapper for Robustness
+            await withRetry(async () => {
+                // 1. Vectorize
+                await VectorService.upsertMemoryVector(env, text, id, timestamp);
+                
+                // 2. D1
+                await createMemory(env.DB, {
+                    id,
+                    text,
+                    tags: JSON.stringify(context_tags),
+                    createdAt: timestamp,
+                    sourceApp: source_app || "unknown",
+                    sessionId: session_id || "unknown",
+                    status: "raw",
+                });
+            });
+
+            logger.log('success', `Memory saved successfully: ${id}`);
+            message.ack();
+        } catch (err: any) {
+            logger.log('error', `Failed to process memory: ${err.message}`);
+            // Don't ack, let it retry or DLQ
+            message.retry();
+        }
+      })
+    );
+  }
 };
+
+// --- API Handlers ---
+
+async function handlePostMemory(req: Request, env: Env) {
+    try {
+        const body = await req.json() as any;
+        const { text, source_app, session_id } = body;
+        
+        if (!text) return new Response("Missing text", { status: 400 });
+
+        // Push to queue for async processing
+        const message: MemoryMessage = {
+            text,
+            context_tags: ["web-ui"],
+            timestamp: Date.now(),
+            source_app: source_app || "web-client",
+            session_id: session_id || "default-session"
+        };
+
+        await env.QUEUE.send(message);
+        
+        return new Response(JSON.stringify({ success: true, status: "queued" }), {
+            headers: { "Content-Type": "application/json" }
+        });
+    } catch (e: any) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+    }
+}
+
+async function handleSearch(req: Request, env: Env, url: URL) {
+    const query = url.searchParams.get("q");
+    if (!query) return new Response(JSON.stringify([]), { headers: { "Content-Type": "application/json" }});
+
+    try {
+        const results = await VectorService.querySimilarVectors(env, query, 10);
+        const ids = results.matches.map((m: any) => m.id);
+        const memories = await getMemoriesByIds(env.DB, ids);
+        
+        // Merge scores
+        const response = memories.map(m => {
+            const match = results.matches.find((r: any) => r.id === m.id);
+            return { ...m, score: match?.score };
+        });
+
+        return new Response(JSON.stringify(response), {
+             headers: { "Content-Type": "application/json" }
+        });
+    } catch (e: any) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+    }
+}
+
+// --- Helpers ---
+
+async function withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (i === retries - 1) throw err;
+            await new Promise(r => setTimeout(r, Math.pow(2, i) * 100)); // Exponential backoff
+        }
+    }
+    throw new Error("Retry failed"); // Should not reach here
+}
+
+// --- Curator ---
+
+async function curateMemories(env: Env): Promise<void> {
+  logger.log('info', "🧹 Curator starting...");
+
+  const rawMemories = await getRawMemories(env.DB, 20);
+
+  if (!rawMemories || rawMemories.length === 0) {
+    return;
+  }
+
+  logger.log('process', `Curating ${rawMemories.length} new memories...`);
+
+  for (const memory of rawMemories) {
+    try {
+        const similar = await VectorService.querySimilarVectors(env, memory.text, 3);
+        const matches = similar.matches.filter(
+            (m: any) => m.id !== memory.id && m.score > Number(env.SIMILIARITY_THRESHOLD || 0.92)
+        );
+
+        if (matches.length > 0) {
+            const matchIds = matches.map((m: any) => m.id);
+            const duplicates = await getMemoriesByIds(env.DB, matchIds);
+
+            if (duplicates.length > 0) {
+                const combinedText = [memory.text, ...duplicates.map((d) => d.text)].join("\n---\n");
+                const prompt = `Consolidate these similar memory fragments into one concise, factual statement. Preserve all context tags/dates if possible.\n\n${combinedText}`;
+
+                const newText = await AIProvider.generateText(env, prompt, {
+                    model: "@cf/openai/gpt-oss-120b",
+                    system: "You are a memory curator. Merge these memories accurately.",
+                });
+
+                await updateConsolidatedMemory(env.DB, memory.id, newText);
+                await VectorService.upsertMemoryVector(env, newText, memory.id, memory.createdAt);
+
+                const deleteIds = duplicates.map((d) => d.id);
+                await deleteMemories(env.DB, deleteIds);
+                await VectorService.deleteMemoryVectors(env, deleteIds);
+
+                logger.log('success', `Merged ${deleteIds.length + 1} memories into ID ${memory.id}`);
+                continue;
+            }
+        }
+
+        await markMemoryProcessed(env.DB, memory.id);
+    } catch (e: any) {
+        logger.log('error', `Curator failed for memory ${memory.id}: ${e.message}`);
+    }
+  }
+}
